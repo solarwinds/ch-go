@@ -14,22 +14,19 @@ jobs:
       fail-fast: true
       matrix:
         go:
-          - "1.19"
-          - "1.20"
+          - "oldstable"
+          - "stable"
         clickhouse:
           - v21.8.14.5-lts
-          - v22.3.11.12-lts
-          - v22.8.5.29-lts
-          - v22.10.1.1877-stable
-          - v22.11.1.1360-stable
-          - v22.12.4.76-stable
-          - v23.1.4.58-stable
-          - v23.2.2.20-stable
+          - v22.8.20.11-lts
+          - v23.10.3.5-stable
+          - v24.11.1.2557-stable
+          - v25.1.2.3-stable
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v5
 
       - name: Install Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
 
@@ -40,7 +37,7 @@ jobs:
           echo "::set-output name=modcache::$(go env GOMODCACHE)"
 
       - name: Set up cache
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ${{ steps.go-env.outputs.cache }}
@@ -50,14 +47,14 @@ jobs:
             e2e-${{ runner.os }}-go${{ matrix.go }}-
 
       - name: Set up ClickHouse cache
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: /opt/ch/clickhouse
           key: ClickHouse-${{ matrix.clickhouse }}
 
       - name: Check ClickHouse
         id: "ch_exists"
-        uses: andstor/file-existence-action@v2
+        uses: andstor/file-existence-action@v3
         with:
           files: /opt/ch/clickhouse
 

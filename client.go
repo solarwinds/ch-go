@@ -17,6 +17,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
+	cryptossh "golang.org/x/crypto/ssh"
 
 	"github.com/ClickHouse/ch-go/compress"
 	pkgVersion "github.com/ClickHouse/ch-go/internal/version"
@@ -29,7 +30,7 @@ import (
 type Client struct {
 	lg       *zap.Logger
 	conn     net.Conn
-	buf      *proto.Buffer
+	writer   *proto.Writer
 	reader   *proto.Reader
 	info     proto.ClientHello
 	server   proto.ServerHello
@@ -51,11 +52,13 @@ type Client struct {
 
 	// compressor performs block compression,
 	// see encodeBlock.
-	compressor        *compress.Writer
-	compression       proto.Compression
-	compressionMethod compress.Method
+	compressor  *compress.Writer
+	compression proto.Compression
 
 	settings []Setting
+
+	// SSH authentication
+	sshSigner cryptossh.Signer
 }
 
 // Setting to send to server.
@@ -129,6 +132,25 @@ func (e *Exception) Error() string {
 	msg := strings.TrimPrefix(e.Message, e.Name+":")
 	msg = strings.TrimSpace(msg)
 	return fmt.Sprintf("%s: %s: %s", e.Code, e.Name, msg)
+}
+
+// Unwrap implements errors.Unwrap interface.
+func (e *Exception) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+	// Flatten error tree by collecting all error codes.
+	// Only check error codes since only they can be compared using errors.Is.
+	// Dynamically created Exceptions are not relevant for this functionality.
+	return e.collectCodes(nil)
+}
+
+func (e *Exception) collectCodes(codes []error) []error {
+	result := append(codes, e.Code)
+	for _, next := range e.Next {
+		result = next.collectCodes(result)
+	}
+	return result
 }
 
 // AsException finds first *Exception in err chain.
@@ -255,6 +277,7 @@ func (c *Client) packet(ctx context.Context) (proto.ServerCode, error) {
 }
 
 func (c *Client) flushBuf(ctx context.Context, b *proto.Buffer) error {
+	defer b.Reset()
 	if err := ctx.Err(); err != nil {
 		return errors.Wrap(err, "context")
 	}
@@ -276,22 +299,40 @@ func (c *Client) flushBuf(ctx context.Context, b *proto.Buffer) error {
 	if n != len(b.Buf) {
 		return errors.Wrap(io.ErrShortWrite, "wrote less than expected")
 	}
-	if ce := c.lg.Check(zap.DebugLevel, "Flush"); ce != nil {
+	if ce := c.lg.Check(zap.DebugLevel, "Buffer flush"); ce != nil {
 		ce.Write(zap.Int("bytes", n))
 	}
-	b.Reset()
 	return nil
 }
 
 func (c *Client) flush(ctx context.Context) error {
-	return c.flushBuf(ctx, c.buf)
+	if err := ctx.Err(); err != nil {
+		return errors.Wrap(err, "context")
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := c.conn.SetWriteDeadline(deadline); err != nil {
+			return errors.Wrap(err, "set write deadline")
+		}
+		// Reset deadline.
+		defer func() { _ = c.conn.SetWriteDeadline(time.Time{}) }()
+	}
+	n, err := c.writer.Flush()
+	if err != nil {
+		return err
+	}
+	if ce := c.lg.Check(zap.DebugLevel, "Flush"); ce != nil {
+		ce.Write(zap.Int64("bytes", n))
+	}
+	return nil
 }
 
 func (c *Client) encode(v proto.AwareEncoder) {
-	v.EncodeAware(c.buf, c.protocolVersion)
+	c.writer.ChainBuffer(func(b *proto.Buffer) {
+		v.EncodeAware(b, c.protocolVersion)
+	})
 }
 
-//go:generate go run github.com/dmarkham/enumer -transform snake_upper -type Compression -trimprefix Compression -output compression_enum.go
+//go:generate go run github.com/dmarkham/enumer -transform upper -type Compression -trimprefix Compression -output compression_enum.go
 
 // Compression setting.
 //
@@ -307,18 +348,27 @@ const (
 	CompressionZSTD
 	// CompressionNone uses no compression but data has checksums.
 	CompressionNone
+	// CompressionLZ4HC enables LZ4HC compression for data. High CPU overhead.
+	CompressionLZ4HC
 )
+
+// CompressionLevel setting. A level == 0 is invalid and resolves to the default.
+//
+// Supported by: LZ4HC.
+type CompressionLevel uint32
 
 // Options for Client. Zero value is valid.
 type Options struct {
-	Logger      *zap.Logger // defaults to Nop.
-	Address     string      // 127.0.0.1:9000
-	Database    string      // "default"
-	User        string      // "default"
-	Password    string      // blank string by default
-	QuotaKey    string      // blank string by default
-	Compression Compression // disabled by default
-	Settings    []Setting   // none by default
+	Logger           *zap.Logger      // defaults to Nop.
+	Address          string           // 127.0.0.1:9000
+	Database         string           // "default"
+	User             string           // "default"
+	Password         string           // blank string by default
+	QuotaKey         string           // blank string by default
+	Compression      Compression      // disabled by default
+	CompressionLevel CompressionLevel // compression algorithm specific default
+	ClientName       string           // blank string by default
+	Settings         []Setting        // none by default
 
 	// ReadTimeout is a timeout for reading a single packet from the server.
 	//
@@ -339,6 +389,9 @@ type Options struct {
 	OpenTelemetryInstrumentation bool
 	TracerProvider               trace.TracerProvider
 	MeterProvider                metric.MeterProvider
+
+	// SSH authentication.
+	SSHSigner cryptossh.Signer
 
 	meter  metric.Meter
 	tracer trace.Tracer
@@ -402,9 +455,6 @@ func (o *Options) setDefaults() {
 	if o.ReadTimeout == 0 {
 		o.ReadTimeout = DefaultReadTimeout
 	}
-	if o.ReadTimeout < 0 || o.ReadTimeout == NoTimeout {
-		o.ReadTimeout = 0
-	}
 }
 
 type clientVersion struct {
@@ -417,18 +467,30 @@ type clientVersion struct {
 // Connect performs handshake with ClickHouse server and initializes
 // application level connection.
 func Connect(ctx context.Context, conn net.Conn, opt Options) (*Client, error) {
+	return ConnectWithBuffer(ctx, conn, opt, new(proto.Buffer))
+}
+
+// ConnectWithBuffer performs handshake with ClickHouse server and initializes
+// application level connection using the provided buffer.
+func ConnectWithBuffer(ctx context.Context, conn net.Conn, opt Options, buf *proto.Buffer) (*Client, error) {
 	opt.setDefaults()
 
+	clientName := proto.Name
 	pkg := pkgVersion.Get()
+	if opt.ClientName == "" {
+		if pkg.Name != "" {
+			clientName = fmt.Sprintf("%s (%s)", clientName, pkg.Name)
+		}
+	} else {
+		clientName = fmt.Sprintf("%s %s", clientName, opt.ClientName)
+	}
 	ver := clientVersion{
-		Name:  proto.Name,
+		Name:  clientName,
 		Major: pkg.Major,
 		Minor: pkg.Minor,
 		Patch: pkg.Patch,
 	}
-	if pkg.Name != "" {
-		ver.Name = fmt.Sprintf("%s (%s)", proto.Name, pkg.Name)
-	}
+
 	if opt.OpenTelemetryInstrumentation {
 		newCtx, span := opt.tracer.Start(ctx, "Connect",
 			trace.WithSpanKind(trace.SpanKindClient),
@@ -439,9 +501,36 @@ func Connect(ctx context.Context, conn net.Conn, opt Options) (*Client, error) {
 		ctx = newCtx
 		defer span.End()
 	}
+
+	var (
+		compression       proto.Compression
+		compressionMethod compress.Method
+	)
+	switch opt.Compression {
+	case CompressionLZ4:
+		compression = proto.CompressionEnabled
+		compressionMethod = compress.LZ4
+	case CompressionLZ4HC:
+		compression = proto.CompressionEnabled
+		compressionMethod = compress.LZ4HC
+	case CompressionZSTD:
+		compression = proto.CompressionEnabled
+		compressionMethod = compress.ZSTD
+	case CompressionNone:
+		compression = proto.CompressionEnabled
+		compressionMethod = compress.None
+	default:
+		compression = proto.CompressionDisabled
+	}
+
+	user := opt.User
+	if opt.SSHSigner != nil {
+		user = " SSH KEY AUTHENTICATION " + user
+	}
+
 	c := &Client{
 		conn:     conn,
-		buf:      new(proto.Buffer),
+		writer:   proto.NewWriter(conn, buf),
 		reader:   proto.NewReader(conn),
 		settings: opt.Settings,
 		lg:       opt.Logger,
@@ -452,34 +541,21 @@ func Connect(ctx context.Context, conn net.Conn, opt Options) (*Client, error) {
 
 		readTimeout: opt.ReadTimeout,
 
-		compressor: compress.NewWriter(),
+		compression: compression,
+		compressor:  compress.NewWriter(compress.Level(opt.CompressionLevel), compressionMethod),
 
 		version:         ver,
 		protocolVersion: opt.ProtocolVersion,
 		info: proto.ClientHello{
-			Name:  ver.Name,
-			Major: ver.Major,
-			Minor: ver.Minor,
-
+			Name:            clientName,
+			Major:           ver.Major,
+			Minor:           ver.Minor,
 			ProtocolVersion: opt.ProtocolVersion,
-
-			Database: opt.Database,
-			User:     opt.User,
-			Password: opt.Password,
+			Database:        opt.Database,
+			User:            user,
+			Password:        opt.Password,
 		},
-	}
-	switch opt.Compression {
-	case CompressionLZ4:
-		c.compression = proto.CompressionEnabled
-		c.compressionMethod = compress.LZ4
-	case CompressionZSTD:
-		c.compression = proto.CompressionEnabled
-		c.compressionMethod = compress.ZSTD
-	case CompressionNone:
-		c.compression = proto.CompressionEnabled
-		c.compressionMethod = compress.None
-	default:
-		c.compression = proto.CompressionDisabled
+		sshSigner: opt.SSHSigner,
 	}
 
 	handshakeCtx, cancel := context.WithTimeout(ctx, opt.HandshakeTimeout)
@@ -499,6 +575,12 @@ type Dialer interface {
 // Dial dials requested address and establishes TCP connection to ClickHouse
 // server, performing handshake.
 func Dial(ctx context.Context, opt Options) (c *Client, err error) {
+	return DialWithBuffer(ctx, opt, new(proto.Buffer))
+}
+
+// DialWithBuffer dials requested address and establishes TCP connection to ClickHouse
+// server, performing handshake using the provided buffer.
+func DialWithBuffer(ctx context.Context, opt Options, buf *proto.Buffer) (c *Client, err error) {
 	opt.setDefaults()
 
 	if opt.OpenTelemetryInstrumentation {
@@ -536,7 +618,7 @@ func Dial(ctx context.Context, opt Options) (c *Client, err error) {
 		return nil, errors.Wrap(err, "dial")
 	}
 
-	client, err := Connect(ctx, conn, opt)
+	client, err := ConnectWithBuffer(ctx, conn, opt, buf)
 	if err != nil {
 		return nil, errors.Wrap(err, "connect")
 	}

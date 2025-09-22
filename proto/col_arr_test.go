@@ -23,6 +23,7 @@ func testColumn[T any](t *testing.T, name string, f func() ColumnOf[T], values .
 	t.Run("Golden", func(t *testing.T) {
 		gold.Bytes(t, buf.Buf, "column_of_"+name)
 	})
+	t.Run("WriteColumn", checkWriteColumn(data))
 	t.Run("Ok", func(t *testing.T) {
 		br := bytes.NewReader(buf.Buf)
 		r := NewReader(br)
@@ -73,7 +74,9 @@ func TestColArrOfStr(t *testing.T) {
 		require.Equal(t, col.Rows(), dec.Rows())
 		require.Equal(t, ColumnType("Array(String)"), dec.Type())
 		require.Equal(t, []string{"foo", "bar", "foo", "foo", "baz"}, dec.Row(0))
+		require.Equal(t, 5, dec.RowLen(0))
 		require.Equal(t, []string{"foo", "baz"}, dec.Row(1))
+		require.Equal(t, 2, dec.RowLen(1))
 	})
 	t.Run("EOF", func(t *testing.T) {
 		r := NewReader(bytes.NewReader(nil))
@@ -84,6 +87,7 @@ func TestColArrOfStr(t *testing.T) {
 		dec := (&ColStr{}).Array()
 		requireNoShortRead(t, buf.Buf, colAware(dec, col.Rows()))
 	})
+	t.Run("WriteColumn", checkWriteColumn(col))
 }
 
 func TestArrOfLowCordStr(t *testing.T) {
@@ -107,7 +111,9 @@ func TestArrOfLowCordStr(t *testing.T) {
 		require.Equal(t, col.Rows(), dec.Rows())
 		require.Equal(t, ColumnType("Array(LowCardinality(String))"), dec.Type())
 		require.Equal(t, []string{"foo", "bar", "foo", "foo", "baz"}, dec.Row(0))
+		require.Equal(t, 5, dec.RowLen(0))
 		require.Equal(t, []string{"foo", "baz"}, dec.Row(1))
+		require.Equal(t, 2, dec.RowLen(1))
 	})
 	t.Run("EOF", func(t *testing.T) {
 		r := NewReader(bytes.NewReader(nil))
@@ -118,6 +124,7 @@ func TestArrOfLowCordStr(t *testing.T) {
 		dec := NewArray[string](new(ColStr).LowCardinality())
 		requireNoShortRead(t, buf.Buf, colAware(dec, col.Rows()))
 	})
+	t.Run("WriteColumn", checkWriteColumn(col))
 }
 
 func TestColArr_DecodeColumn(t *testing.T) {

@@ -87,8 +87,6 @@ func (r *Reader) UVarInt() (uint64, error) {
 	return n, nil
 }
 
-const maxStrSize = 10 * 1024 * 1024 // 10 MB
-
 func (r *Reader) StrLen() (int, error) {
 	n, err := r.Int()
 	if err != nil {
@@ -97,10 +95,6 @@ func (r *Reader) StrLen() (int, error) {
 
 	if n < 0 {
 		return 0, errors.Errorf("size %d is invalid", n)
-	}
-	if n > maxStrSize {
-		// Protecting from possible OOM.
-		return 0, errors.Errorf("size %d too big (%d is maximum)", n, maxStrSize)
 	}
 
 	return n, nil
@@ -141,12 +135,17 @@ func (r *Reader) StrBytes() ([]byte, error) {
 
 // Str decodes string.
 func (r *Reader) Str() (string, error) {
-	s, err := r.StrBytes()
+	defer r.b.Reset()
+
+	// call StrRaw instead of StrBytes and converting
+	// so we can avoid a second allocation and copy of
+	// the str/[]byte data
+	str, err := r.StrRaw()
 	if err != nil {
-		return "", errors.Wrap(err, "bytes")
+		return "", errors.Wrap(err, "raw")
 	}
 
-	return string(s), err
+	return string(str), err
 }
 
 // Int decodes uvarint as int.

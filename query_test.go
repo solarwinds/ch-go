@@ -27,6 +27,37 @@ func requireEqual[T any](t *testing.T, a, b proto.ColumnOf[T]) {
 	}
 }
 
+func TestWithTotals(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	conn := Conn(t)
+	var n proto.ColUInt64
+	var c proto.ColUInt64
+
+	var data []uint64
+	query := Query{
+		Body: `
+			SELECT
+				number AS n,
+				COUNT() AS c
+			FROM (
+				SELECT number FROM system.numbers LIMIT 100
+			) GROUP BY n WITH TOTALS
+		`,
+		Result: proto.Results{
+			{Name: "n", Data: &n},
+			{Name: "c", Data: &c},
+		},
+		OnResult: func(ctx context.Context, b proto.Block) error {
+			data = append(data, c...)
+			return nil
+		},
+	}
+	require.NoError(t, conn.Do(ctx, query))
+	require.Equal(t, 101, len(data))
+	require.Equal(t, uint64(100), data[100])
+}
+
 func TestDateTimeOverflow(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -936,6 +967,90 @@ func TestClient_Query(t *testing.T) {
 			},
 		}), "select table")
 	})
+	t.Run("InsertJSONStr", func(t *testing.T) {
+		t.Parallel()
+		conn := ConnOpt(t, Options{
+			Settings: []Setting{
+				{Key: "enable_json_type", Value: "1"},
+				{Key: "output_format_native_write_json_as_string", Value: "1"},
+			},
+		})
+		SkipNoFeature(t, conn, proto.FeatureJSONStrings)
+
+		createTable := Query{
+			Body: "CREATE TABLE json_test_table (c JSON) ENGINE = MergeTree ORDER BY tuple()",
+		}
+		require.NoError(t, conn.Do(ctx, createTable), "create table")
+
+		data := proto.ColJSONStr{}
+		data.Append(`{"x":"test1"}`)
+
+		insertQuery := Query{
+			Body: "INSERT INTO json_test_table VALUES",
+			Input: []proto.InputColumn{
+				{Name: "c", Data: &data},
+			},
+		}
+		require.NoError(t, conn.Do(ctx, insertQuery), "insert")
+
+		t.Run("Read", func(t *testing.T) {
+			// Select single JSON row.
+			var data proto.ColJSONStr
+			require.NoError(t, conn.Do(ctx, Query{
+				Body: `SELECT '{"x":"test1"}'::JSON AS j`,
+				Result: proto.Results{
+					{
+						Name: "j",
+						Data: &data,
+					},
+				},
+			}))
+			require.Equal(t, 1, data.Rows())
+			require.Equal(t, `{"x":"test1"}`, data.First())
+		})
+	})
+	t.Run("InsertArrayJSONStr", func(t *testing.T) {
+		t.Parallel()
+		conn := ConnOpt(t, Options{
+			Settings: []Setting{
+				{Key: "enable_json_type", Value: "1"},
+				{Key: "output_format_native_write_json_as_string", Value: "1"},
+			},
+		})
+		SkipNoFeature(t, conn, proto.FeatureJSONStrings)
+
+		createTable := Query{
+			Body: "CREATE TABLE json_test_table (c Array(JSON)) ENGINE = MergeTree ORDER BY tuple()",
+		}
+		require.NoError(t, conn.Do(ctx, createTable), "create table")
+
+		data := proto.NewArray[string](&proto.ColJSONStr{})
+		data.Append([]string{`{"x":"test1"}`, `{"y":"test2"}`})
+
+		insertQuery := Query{
+			Body: "INSERT INTO json_test_table VALUES",
+			Input: []proto.InputColumn{
+				{Name: "c", Data: data},
+			},
+		}
+		require.NoError(t, conn.Do(ctx, insertQuery), "insert")
+
+		t.Run("Read", func(t *testing.T) {
+			// Select single Array(JSON) row.
+			data := proto.NewArray[string](&proto.ColJSONStr{})
+			require.NoError(t, conn.Do(ctx, Query{
+				Body: `SELECT ['{"x":"test1"}', '{"y":"test2"}']::Array(JSON) AS j`,
+				Result: proto.Results{
+					{
+						Name: "j",
+						Data: data,
+					},
+				},
+			}))
+			require.Equal(t, 1, data.Rows())
+			require.Equal(t, []string{`{"x":"test1"}`, `{"y":"test2"}`}, data.Row(0))
+		})
+	})
 }
 
 func TestClientCompression(t *testing.T) {
@@ -1030,6 +1145,7 @@ func TestClientCompression(t *testing.T) {
 		}
 	}
 	t.Run("LZ4", testCompression(CompressionLZ4))
+	t.Run("LZ4HC", testCompression(CompressionLZ4HC))
 	t.Run("ZSTD", testCompression(CompressionZSTD))
 	t.Run("None", testCompression(CompressionNone))
 	t.Run("Disabled", testCompression(CompressionDisabled))
@@ -1061,9 +1177,15 @@ func TestClient_ServerLog(t *testing.T) {
 			Body:    "SELECT 'foo' as s",
 			QueryID: qID,
 			OnLog: func(ctx context.Context, l Log) error {
-				t.Logf("Log: %s", l.Text)
-				logs++
 				assert.Equal(t, qID, l.QueryID)
+				return nil
+			},
+			OnLogs: func(ctx context.Context, events []Log) error {
+				logs += len(events)
+				for _, l := range events {
+					t.Logf("Log: %s", l.Text)
+					assert.Equal(t, qID, l.QueryID)
+				}
 				return nil
 			},
 			Result: proto.Results{
@@ -1147,11 +1269,20 @@ func TestClient_ServerProfileEvents(t *testing.T) {
 	if !conn.ServerInfo().Has(proto.FeatureProfileEvents) {
 		t.Skip("Profile events not supported")
 	}
-	var events int
+	var (
+		events      int
+		eventsBatch int
+	)
 	selectStr := Query{
 		Body: "SELECT 1",
 		OnProfileEvent: func(ctx context.Context, p ProfileEvent) error {
+			// Deprecated.
+			// TODO: remove
 			events++
+			return nil
+		},
+		OnProfileEvents: func(ctx context.Context, e []ProfileEvent) error {
+			eventsBatch += len(e)
 			return nil
 		},
 		Result: proto.Results{
@@ -1163,6 +1294,7 @@ func TestClient_ServerProfileEvents(t *testing.T) {
 	if events == 0 {
 		t.Fatal("No profile events")
 	}
+	require.Equal(t, events, eventsBatch)
 }
 
 func TestClient_Query_Bool(t *testing.T) {
